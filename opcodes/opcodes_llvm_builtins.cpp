@@ -3123,6 +3123,325 @@ static void emit_copy_memory(Converter::Impl &impl, spv::Id target, spv::Id sour
 	impl.add(copy);
 }
 
+// xbox.global_store_dword*_with_cache(i32 op, i64 address, value, i32, i32):
+// stores 1, 3 or 4 dwords to a GPU virtual address. The last two arguments are not interpreted.
+static bool emit_xbox_global_store(Converter::Impl &impl, const llvm::CallInst &inst, unsigned components)
+{
+	auto &builder = impl.builder();
+	spv::Id uint_type = builder.makeUintType(32);
+	spv::Id value_type = components == 1 ? uint_type : builder.makeVectorType(uint_type, components);
+	spv::Id ptr_type = builder.makePointer(spv::StorageClassPhysicalStorageBuffer, value_type);
+
+	auto *cast_op = impl.allocate(spv::OpConvertUToPtr, ptr_type);
+	cast_op->add_id(impl.get_id_for_value(inst.getOperand(1)));
+	impl.add(cast_op);
+
+	spv::Id value_id = impl.get_id_for_value(inst.getOperand(2));
+	if (components > 1)
+	{
+		spv::Id elems[4];
+		for (unsigned i = 0; i < components; i++)
+		{
+			auto *extract = impl.allocate(spv::OpCompositeExtract, uint_type);
+			extract->add_id(value_id);
+			extract->add_literal(i);
+			impl.add(extract);
+			elems[i] = extract->id;
+		}
+
+		auto *construct = impl.allocate(spv::OpCompositeConstruct, value_type);
+		for (unsigned i = 0; i < components; i++)
+			construct->add_id(elems[i]);
+		impl.add(construct);
+		value_id = construct->id;
+	}
+
+	auto *store = impl.allocate(spv::OpStore);
+	store->add_id(cast_op->id);
+	store->add_id(value_id);
+	store->add_literal(spv::MemoryAccessAlignedMask);
+	store->add_literal(4);
+	add_vkmm_access_qualifiers(impl, store, { true });
+	impl.add(store);
+	return true;
+}
+
+// xbox.global_load_dword*_with_cache / xbox.s_load_dword_with_cache(i32 op, i64 address, i32, i32):
+// loads 1 to 4 dwords from a GPU virtual address; more than one come back as a structure of i32.
+// The last two arguments are not interpreted.
+static bool emit_xbox_global_load(Converter::Impl &impl, const llvm::CallInst &inst, unsigned components)
+{
+	auto &builder = impl.builder();
+	spv::Id uint_type = builder.makeUintType(32);
+	spv::Id value_type = components == 1 ? uint_type : builder.makeVectorType(uint_type, components);
+	spv::Id ptr_type = builder.makePointer(spv::StorageClassPhysicalStorageBuffer, value_type);
+
+	auto *cast_op = impl.allocate(spv::OpConvertUToPtr, ptr_type);
+	cast_op->add_id(impl.get_id_for_value(inst.getOperand(1)));
+	impl.add(cast_op);
+
+	if (components == 1)
+	{
+		auto *load = impl.allocate(spv::OpLoad, &inst);
+		load->add_id(cast_op->id);
+		load->add_literal(spv::MemoryAccessAlignedMask);
+		load->add_literal(4);
+		add_vkmm_access_qualifiers(impl, load, { true });
+		impl.add(load);
+		return true;
+	}
+
+	auto *load = impl.allocate(spv::OpLoad, value_type);
+	load->add_id(cast_op->id);
+	load->add_literal(spv::MemoryAccessAlignedMask);
+	load->add_literal(4);
+	add_vkmm_access_qualifiers(impl, load, { true });
+	impl.add(load);
+
+	spv::Id elems[4];
+	for (unsigned i = 0; i < components; i++)
+	{
+		auto *extract = impl.allocate(spv::OpCompositeExtract, uint_type);
+		extract->add_id(load->id);
+		extract->add_literal(i);
+		impl.add(extract);
+		elems[i] = extract->id;
+	}
+
+	auto *construct = impl.allocate(spv::OpCompositeConstruct, &inst);
+	for (unsigned i = 0; i < components; i++)
+		construct->add_id(elems[i]);
+	impl.add(construct);
+	return true;
+}
+
+// xbox.global_atomic_add / _sub (i32 op, i64 address, i32 value) and xbox.global_atomic_fmin / _fmax
+// (i32 op, i64 address, float value): the value at the address before the operation comes back.
+static bool emit_xbox_global_atomic(Converter::Impl &impl, const llvm::CallInst &inst, spv::Op opcode)
+{
+	auto &builder = impl.builder();
+	spv::Id value_type = impl.get_type_id(inst.getType());
+	spv::Id ptr_type = builder.makePointer(spv::StorageClassPhysicalStorageBuffer, value_type);
+
+	if (opcode == spv::OpAtomicFMinEXT || opcode == spv::OpAtomicFMaxEXT)
+	{
+		builder.addExtension("SPV_EXT_shader_atomic_float_min_max");
+		builder.addCapability(spv::CapabilityAtomicFloat32MinMaxEXT);
+	}
+
+	auto *cast_op = impl.allocate(spv::OpConvertUToPtr, ptr_type);
+	cast_op->add_id(impl.get_id_for_value(inst.getOperand(1)));
+	impl.add(cast_op);
+
+	auto *op = impl.allocate(opcode, &inst);
+	op->add_id(cast_op->id);
+	op->add_id(builder.getAtomicDeviceScopeId());
+	op->add_id(builder.makeUintConstant(0));
+	op->add_id(impl.get_id_for_value(inst.getOperand(2)));
+	impl.add(op);
+	return true;
+}
+
+static spv::Id emit_xbox_std450(Converter::Impl &impl, spv::Id type, GLSLstd450 op, spv::Id a, spv::Id b)
+{
+	if (!impl.glsl_std450_ext)
+		impl.glsl_std450_ext = impl.builder().import("GLSL.std.450");
+	auto *ext = impl.allocate(spv::OpExtInst, type);
+	ext->add_id(impl.glsl_std450_ext);
+	ext->add_literal(op);
+	ext->add_id(a);
+	ext->add_id(b);
+	impl.add(ext);
+	return ext->id;
+}
+
+static spv::Id emit_xbox_binary(Converter::Impl &impl, spv::Op opcode, spv::Id type, spv::Id a, spv::Id b)
+{
+	auto *op = impl.allocate(opcode, type);
+	op->add_id(a);
+	op->add_id(b);
+	impl.add(op);
+	return op->id;
+}
+
+// xbox.Min3 / Max3 / Med3 (i32 op, a, b, c), float or unsigned: the smallest, largest or middle of three.
+// Float minimum and maximum are taken as the NMin/NMax that dx.op FMin/FMax use here.
+static bool emit_xbox_three(Converter::Impl &impl, const llvm::CallInst &inst, int kind, bool is_float)
+{
+	spv::Id type = impl.get_type_id(inst.getType());
+	GLSLstd450 min_op = is_float ? GLSLstd450NMin : GLSLstd450UMin;
+	GLSLstd450 max_op = is_float ? GLSLstd450NMax : GLSLstd450UMax;
+	spv::Id a = impl.get_id_for_value(inst.getOperand(1));
+	spv::Id b = impl.get_id_for_value(inst.getOperand(2));
+	spv::Id c = impl.get_id_for_value(inst.getOperand(3));
+	spv::Id result;
+
+	if (kind < 0)
+		result = emit_xbox_std450(impl, type, min_op, emit_xbox_std450(impl, type, min_op, a, b), c);
+	else if (kind > 0)
+		result = emit_xbox_std450(impl, type, max_op, emit_xbox_std450(impl, type, max_op, a, b), c);
+	else
+	{
+		spv::Id lo = emit_xbox_std450(impl, type, min_op, a, b);
+		spv::Id hi = emit_xbox_std450(impl, type, max_op, a, b);
+		result = emit_xbox_std450(impl, type, max_op, lo, emit_xbox_std450(impl, type, min_op, hi, c));
+	}
+
+	impl.rewrite_value(&inst, result);
+	return true;
+}
+
+// xbox.BFI(i32 op, mask, a, b): (mask & a) | (~mask & b).
+static bool emit_xbox_bfi(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	spv::Id type = impl.get_type_id(inst.getType());
+	spv::Id mask = impl.get_id_for_value(inst.getOperand(1));
+	spv::Id a = impl.get_id_for_value(inst.getOperand(2));
+	spv::Id b = impl.get_id_for_value(inst.getOperand(3));
+
+	auto *inv = impl.allocate(spv::OpNot, type);
+	inv->add_id(mask);
+	impl.add(inv);
+
+	spv::Id lhs = emit_xbox_binary(impl, spv::OpBitwiseAnd, type, mask, a);
+	spv::Id rhs = emit_xbox_binary(impl, spv::OpBitwiseAnd, type, inv->id, b);
+	impl.rewrite_value(&inst, emit_xbox_binary(impl, spv::OpBitwiseOr, type, lhs, rhs));
+	return true;
+}
+
+// xbox.V_ALIGNBYTE_B32(i32 op, hi, lo, shift): the low 32 bits of the 64-bit value hi:lo shifted right by
+// 8 * (shift & 3) bits.
+static bool emit_xbox_alignbyte(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	auto &builder = impl.builder();
+	spv::Id type = impl.get_type_id(inst.getType());
+	spv::Id hi = impl.get_id_for_value(inst.getOperand(1));
+	spv::Id lo = impl.get_id_for_value(inst.getOperand(2));
+	spv::Id shift = impl.get_id_for_value(inst.getOperand(3));
+
+	spv::Id bytes = emit_xbox_binary(impl, spv::OpBitwiseAnd, type, shift, builder.makeUintConstant(3));
+	spv::Id bits = emit_xbox_binary(impl, spv::OpIMul, type, bytes, builder.makeUintConstant(8));
+	spv::Id low_part = emit_xbox_binary(impl, spv::OpShiftRightLogical, type, lo, bits);
+	spv::Id back = emit_xbox_binary(impl, spv::OpISub, type, builder.makeUintConstant(32), bits);
+	spv::Id high_part = emit_xbox_binary(impl, spv::OpShiftLeftLogical, type, hi, back);
+	spv::Id joined = emit_xbox_binary(impl, spv::OpBitwiseOr, type, low_part, high_part);
+	spv::Id is_zero = emit_xbox_binary(impl, spv::OpIEqual, builder.makeBoolType(), bits, builder.makeUintConstant(0));
+
+	auto *sel = impl.allocate(spv::OpSelect, type);
+	sel->add_id(is_zero);
+	sel->add_id(lo);
+	sel->add_id(joined);
+	impl.add(sel);
+	impl.rewrite_value(&inst, sel->id);
+	return true;
+}
+
+// xbox.V_PK_MIN_F16 / V_PK_MAX_F16(i32 op, {half, half} a, {half, half} b): both halves at once.
+static bool emit_xbox_packed_half(Converter::Impl &impl, const llvm::CallInst &inst, bool is_max)
+{
+	spv::Id elem_type = impl.get_type_id(inst.getType()->getStructElementType(0));
+	spv::Id a = impl.get_id_for_value(inst.getOperand(1));
+	spv::Id b = impl.get_id_for_value(inst.getOperand(2));
+	spv::Id parts[2];
+
+	for (unsigned i = 0; i < 2; i++)
+	{
+		auto *ea = impl.allocate(spv::OpCompositeExtract, elem_type);
+		ea->add_id(a);
+		ea->add_literal(i);
+		impl.add(ea);
+		auto *eb = impl.allocate(spv::OpCompositeExtract, elem_type);
+		eb->add_id(b);
+		eb->add_literal(i);
+		impl.add(eb);
+		parts[i] = emit_xbox_std450(impl, elem_type, is_max ? GLSLstd450NMax : GLSLstd450NMin, ea->id, eb->id);
+	}
+
+	auto *construct = impl.allocate(spv::OpCompositeConstruct, &inst);
+	construct->add_id(parts[0]);
+	construct->add_id(parts[1]);
+	impl.add(construct);
+	return true;
+}
+
+// xbox.S_BCNT1_U64(i32 op, {i32 lo, i32 hi}): the number of set bits of the 64-bit value.
+static bool emit_xbox_bcnt64(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	spv::Id type = impl.get_type_id(inst.getType());
+	spv::Id value = impl.get_id_for_value(inst.getOperand(1));
+	spv::Id counts[2];
+
+	for (unsigned i = 0; i < 2; i++)
+	{
+		auto *e = impl.allocate(spv::OpCompositeExtract, type);
+		e->add_id(value);
+		e->add_literal(i);
+		impl.add(e);
+		auto *count = impl.allocate(spv::OpBitCount, type);
+		count->add_id(e->id);
+		impl.add(count);
+		counts[i] = count->id;
+	}
+
+	impl.rewrite_value(&inst, emit_xbox_binary(impl, spv::OpIAdd, type, counts[0], counts[1]));
+	return true;
+}
+
+// Calls to the functions of the Xbox shader compiler (xbox.*), by name.
+bool emit_xbox_call_instruction(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	const char *name = inst.getCalledFunction()->getName().data();
+
+	if (strcmp(name, "xbox.global_store_dword_with_cache") == 0)
+		return emit_xbox_global_store(impl, inst, 1);
+	else if (strcmp(name, "xbox.global_store_dwordx3_with_cache") == 0)
+		return emit_xbox_global_store(impl, inst, 3);
+	else if (strcmp(name, "xbox.global_store_dwordx4_with_cache") == 0)
+		return emit_xbox_global_store(impl, inst, 4);
+	else if (strcmp(name, "xbox.global_load_dword_with_cache") == 0 ||
+	         strcmp(name, "xbox.s_load_dword_with_cache") == 0)
+		return emit_xbox_global_load(impl, inst, 1);
+	else if (strcmp(name, "xbox.global_load_dwordx2_with_cache") == 0)
+		return emit_xbox_global_load(impl, inst, 2);
+	else if (strcmp(name, "xbox.global_load_dwordx3_with_cache") == 0)
+		return emit_xbox_global_load(impl, inst, 3);
+	else if (strcmp(name, "xbox.global_load_dwordx4_with_cache") == 0)
+		return emit_xbox_global_load(impl, inst, 4);
+	else if (strcmp(name, "xbox.global_atomic_add") == 0)
+		return emit_xbox_global_atomic(impl, inst, spv::OpAtomicIAdd);
+	else if (strcmp(name, "xbox.global_atomic_sub") == 0)
+		return emit_xbox_global_atomic(impl, inst, spv::OpAtomicISub);
+	else if (strcmp(name, "xbox.global_atomic_fmin") == 0)
+		return emit_xbox_global_atomic(impl, inst, spv::OpAtomicFMinEXT);
+	else if (strcmp(name, "xbox.global_atomic_fmax") == 0)
+		return emit_xbox_global_atomic(impl, inst, spv::OpAtomicFMaxEXT);
+	else if (strcmp(name, "xbox.Min3_F32") == 0)
+		return emit_xbox_three(impl, inst, -1, true);
+	else if (strcmp(name, "xbox.Med3_F32") == 0)
+		return emit_xbox_three(impl, inst, 0, true);
+	else if (strcmp(name, "xbox.Max3_F32") == 0)
+		return emit_xbox_three(impl, inst, 1, true);
+	else if (strcmp(name, "xbox.Min3_U32") == 0)
+		return emit_xbox_three(impl, inst, -1, false);
+	else if (strcmp(name, "xbox.Med3_U32") == 0)
+		return emit_xbox_three(impl, inst, 0, false);
+	else if (strcmp(name, "xbox.Max3_U32") == 0)
+		return emit_xbox_three(impl, inst, 1, false);
+	else if (strcmp(name, "xbox.BFI") == 0)
+		return emit_xbox_bfi(impl, inst);
+	else if (strcmp(name, "xbox.V_ALIGNBYTE_B32") == 0)
+		return emit_xbox_alignbyte(impl, inst);
+	else if (strcmp(name, "xbox.V_PK_MIN_F16") == 0)
+		return emit_xbox_packed_half(impl, inst, false);
+	else if (strcmp(name, "xbox.V_PK_MAX_F16") == 0)
+		return emit_xbox_packed_half(impl, inst, true);
+	else if (strcmp(name, "xbox.S_BCNT1_U64") == 0)
+		return emit_xbox_bcnt64(impl, inst);
+
+	LOGE("Xbox shader compiler function '%s' is not supported.\n", name);
+	return false;
+}
+
 bool emit_call_instruction(Converter::Impl &impl, const llvm::CallInst &inst)
 {
 	struct WriteBack

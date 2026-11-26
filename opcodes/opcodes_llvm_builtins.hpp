@@ -59,6 +59,7 @@ bool analyze_cast_instruction(Converter::Impl &impl, const llvm::CastInst *instr
 
 bool emit_llvm_instruction(Converter::Impl &impl, const llvm::Instruction &instruction);
 bool emit_call_instruction(Converter::Impl &impl, const llvm::CallInst &instruction);
+bool emit_xbox_call_instruction(Converter::Impl &impl, const llvm::CallInst &instruction);
 
 unsigned physical_integer_bit_width(unsigned width);
 

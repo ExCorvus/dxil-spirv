@@ -6587,6 +6587,10 @@ bool Converter::Impl::emit_instruction(CFGNode *block, const llvm::Instruction &
 			// Just ignore ...
 			return true;
 		}
+		else if (strncmp(called_function->getName().data(), "xbox.", 5) == 0)
+		{
+			return emit_xbox_call_instruction(*this, *call_inst);
+		}
 		else
 		{
 			return emit_call_instruction(*this, *call_inst);
@@ -8533,7 +8537,8 @@ void Converter::Impl::gather_function_dependencies(llvm::Function *caller, Vecto
 			{
 				auto *fn = call_inst->getCalledFunction();
 				if (strncmp(fn->getName().data(), "dx.op", 5) != 0 &&
-				    strncmp(fn->getName().data(), "llvm.", 5) != 0)
+				    strncmp(fn->getName().data(), "llvm.", 5) != 0 &&
+				    strncmp(fn->getName().data(), "xbox.", 5) != 0)
 				{
 					gather_function_dependencies(fn, funcs);
 				}
@@ -9283,8 +9288,10 @@ ConvertedFunction Converter::Impl::convert_entry_point()
 	result.node_pool = std::make_unique<CFGNodePool>();
 	auto &pool = *result.node_pool;
 
+	// Shaders of the Xbox shader compiler address memory by GPU virtual address.
 	bool need_bda =
 		options.physical_storage_buffer ||
+		module.getNamedMetadata("xbox.compiler.options") != nullptr ||
 		(execution_model_lib_target &&
 		 execution_model == spv::ExecutionModelGLCompute);
 
