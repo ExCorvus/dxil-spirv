@@ -32,6 +32,7 @@
 #include "dxil/dxil_ags.hpp"
 #include "dxil/dxil_ray_tracing.hpp"
 #include "dxil/dxil_waveops.hpp"
+#include "dxil/dxil_buffer.hpp"
 #include <limits>
 
 namespace dxil_spv
@@ -3575,7 +3576,8 @@ static bool emit_xbox_wave_min_u32(Converter::Impl &impl, const llvm::CallInst &
 }
 
 // xbox.TypedLoad.i32(i32 op, handle, i32 index, i32 format) -> {i32 x4, i32 status}, the shape of dx.op.bufferLoad.
-// Only seen on a raw buffer passed by GPU address, with format 65 (DXGI_FORMAT_A8_UNORM, one byte). Read here as
+// Seen with format 65 (DXGI_FORMAT_A8_UNORM, one byte) on a raw buffer, which vkd3d-proton hands over either by
+// GPU address or as a storage buffer through a descriptor table, as the shader's root signature says. Read here as
 // the byte at byte offset index, handed back as an integer in the first value (inferred from how the shader uses
 // it: unaligned offsets, only the low bits kept). Other formats and buffer kinds are refused. The other values
 // and the status are 0.
@@ -3585,44 +3587,61 @@ static bool emit_xbox_typed_load(Converter::Impl &impl, const llvm::CallInst &in
 	auto *format_value = llvm::dyn_cast<llvm::ConstantInt>(inst.getOperand(3));
 	spv::Id ptr_id = impl.get_id_for_value(inst.getOperand(1));
 	auto meta_itr = impl.handle_to_resource_meta.find(ptr_id);
+	spv::Id uint_type = builder.makeUintType(32);
+	spv::Id byte_offset = impl.get_id_for_value(inst.getOperand(2));
+	spv::Id word_id = 0;
 
-	if (!format_value || format_value->getUniqueInteger().getZExtValue() != 65 ||
-	    meta_itr == impl.handle_to_resource_meta.end() ||
-	    meta_itr->second.storage != spv::StorageClassPhysicalStorageBuffer || meta_itr->second.stride != 0)
+	bool format_ok = format_value && format_value->getUniqueInteger().getZExtValue() == 65;
+	bool by_address = format_ok && meta_itr != impl.handle_to_resource_meta.end() &&
+	                  meta_itr->second.storage == spv::StorageClassPhysicalStorageBuffer && meta_itr->second.stride == 0;
+	if (format_ok && !by_address)
+		word_id = emit_raw_storage_buffer_load_word_at_byte(impl, &inst);
+
+	if (!by_address && !word_id)
 	{
-		LOGE("xbox.TypedLoad: only format 65 on a raw buffer passed by GPU address is supported.\n");
+		if (meta_itr == impl.handle_to_resource_meta.end())
+			LOGE("xbox.TypedLoad: the handle has no resource meta.\n");
+		else
+			LOGE("xbox.TypedLoad: format %u, handle storage class %u, kind %u, stride %u, raw access chain %u, "
+			     "non-uniform %u, not supported yet.\n",
+			     format_value ? unsigned(format_value->getUniqueInteger().getZExtValue()) : ~0u,
+			     unsigned(meta_itr->second.storage), unsigned(meta_itr->second.kind), meta_itr->second.stride,
+			     unsigned(impl.options.nv_raw_access_chains),
+			     unsigned(meta_itr->second.non_uniform));
 		return false;
 	}
 
-	spv::Id uint_type = builder.makeUintType(32);
-	spv::Id byte_offset = impl.get_id_for_value(inst.getOperand(2));
-	spv::Id word_offset = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, byte_offset, builder.makeUintConstant(~3u));
-	spv::Id address = emit_u32x2_u32_add(impl, ptr_id, word_offset);
+	if (by_address)
+	{
+		spv::Id word_offset = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, byte_offset, builder.makeUintConstant(~3u));
+		spv::Id address = emit_u32x2_u32_add(impl, ptr_id, word_offset);
 
-	auto ptr_meta = meta_itr->second.physical_pointer_meta;
-	ptr_meta.stride = 0;
-	spv::Id block_ptr_type = impl.get_physical_pointer_block_type(uint_type, ptr_meta);
+		auto ptr_meta = meta_itr->second.physical_pointer_meta;
+		ptr_meta.stride = 0;
+		spv::Id block_ptr_type = impl.get_physical_pointer_block_type(uint_type, ptr_meta);
 
-	auto *cast_op = impl.allocate(spv::OpBitcast, block_ptr_type);
-	cast_op->add_id(address);
-	impl.add(cast_op);
+		auto *cast_op = impl.allocate(spv::OpBitcast, block_ptr_type);
+		cast_op->add_id(address);
+		impl.add(cast_op);
 
-	auto *chain_op = impl.allocate(spv::OpInBoundsAccessChain,
-	                               builder.makePointer(spv::StorageClassPhysicalStorageBuffer, uint_type));
-	chain_op->add_id(cast_op->id);
-	chain_op->add_id(builder.makeUintConstant(0));
-	impl.add(chain_op);
+		auto *chain_op = impl.allocate(spv::OpInBoundsAccessChain,
+		                               builder.makePointer(spv::StorageClassPhysicalStorageBuffer, uint_type));
+		chain_op->add_id(cast_op->id);
+		chain_op->add_id(builder.makeUintConstant(0));
+		impl.add(chain_op);
 
-	auto *load = impl.allocate(spv::OpLoad, uint_type);
-	load->add_id(chain_op->id);
-	load->add_literal(spv::MemoryAccessAlignedMask);
-	load->add_literal(4);
-	add_vkmm_access_qualifiers(impl, load, meta_itr->second.vkmm);
-	impl.add(load);
+		auto *load = impl.allocate(spv::OpLoad, uint_type);
+		load->add_id(chain_op->id);
+		load->add_literal(spv::MemoryAccessAlignedMask);
+		load->add_literal(4);
+		add_vkmm_access_qualifiers(impl, load, meta_itr->second.vkmm);
+		impl.add(load);
+		word_id = load->id;
+	}
 
 	spv::Id byte_in_word = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, byte_offset, builder.makeUintConstant(3));
 	spv::Id shift = emit_xbox_binary(impl, spv::OpIMul, uint_type, byte_in_word, builder.makeUintConstant(8));
-	spv::Id shifted = emit_xbox_binary(impl, spv::OpShiftRightLogical, uint_type, load->id, shift);
+	spv::Id shifted = emit_xbox_binary(impl, spv::OpShiftRightLogical, uint_type, word_id, shift);
 	spv::Id value = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, shifted, builder.makeUintConstant(0xff));
 
 	auto *construct = impl.allocate(spv::OpCompositeConstruct, &inst);

@@ -62,6 +62,8 @@ inline bool emit_raw_buffer_store_instruction(Converter::Impl &impl, const llvm:
     return emit_raw_buffer_store_instruction(impl, instruction, is_vector);
 }
 
+spv::Id emit_raw_storage_buffer_load_word_at_byte(Converter::Impl &impl, const llvm::CallInst *instruction);
+
 bool emit_atomic_binop_instruction(Converter::Impl &impl, const llvm::CallInst *instruction);
 bool emit_atomic_cmpxchg_instruction(Converter::Impl &impl, const llvm::CallInst *instruction);
 bool emit_buffer_update_counter_instruction(Converter::Impl &impl, const llvm::CallInst *instruction);

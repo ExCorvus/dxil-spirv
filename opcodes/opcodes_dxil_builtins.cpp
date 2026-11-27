@@ -923,6 +923,42 @@ static void analyze_dxil_buffer_load(Converter::Impl &impl, const llvm::CallInst
 	}
 }
 
+// xbox.TypedLoad(i32 op, handle, i32 byte offset, i32 format) reads one 32-bit word of a raw buffer (see
+// emit_xbox_typed_load), so the buffer needs a 32-bit declaration like a raw bufferLoad of one i32.
+void analyze_xbox_typed_load(Converter::Impl &impl, const llvm::CallInst *instruction)
+{
+	AccessTracking *tracking = nullptr;
+
+	auto itr = impl.llvm_value_to_uav_resource_index_map.find(instruction->getOperand(1));
+	if (itr != impl.llvm_value_to_uav_resource_index_map.end())
+		tracking = &impl.uav_access_tracking[itr->second];
+
+	if (!tracking)
+	{
+		itr = impl.llvm_value_to_srv_resource_index_map.find(instruction->getOperand(1));
+		if (itr != impl.llvm_value_to_srv_resource_index_map.end())
+			tracking = &impl.srv_access_tracking[itr->second];
+	}
+
+	if (!tracking)
+	{
+		auto annotate_itr = impl.llvm_annotate_handle_uses.find(instruction->getOperand(1));
+		if (annotate_itr != impl.llvm_annotate_handle_uses.end())
+			tracking = &annotate_itr->second.tracking;
+	}
+
+	if (!tracking)
+		return;
+
+	tracking->has_read = true;
+	auto meta = get_resource_meta_from_buffer_op(impl, instruction);
+	if (meta.kind == DXIL::ResourceKind::RawBuffer)
+	{
+		update_raw_access_tracking_for_byte_address(impl, *tracking, instruction->getOperand(2)->getType(),
+		                                            instruction->getOperand(2), 1);
+	}
+}
+
 static void analyze_dxil_buffer_store(Converter::Impl &impl, const llvm::CallInst *instruction, DXIL::Op opcode)
 {
 	AccessTracking *tracking = nullptr;

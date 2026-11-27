@@ -9139,6 +9139,10 @@ bool Converter::Impl::analyze_instructions(llvm::Function *func, const Vector<ll
 					if (!analyze_dxil_instruction_secondary_pass(*this, call_inst))
 						return false;
 				}
+				else if (strncmp(called_function->getName().data(), "xbox.TypedLoad", 14) == 0)
+				{
+					analyze_xbox_typed_load(*this, call_inst);
+				}
 			}
 		}
 

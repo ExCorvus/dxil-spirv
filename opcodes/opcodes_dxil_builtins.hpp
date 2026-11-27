@@ -34,6 +34,7 @@ bool dxil_instruction_has_side_effects(const llvm::CallInst *instruction);
 
 bool analyze_dxil_instruction_primary_pass(Converter::Impl &impl, const llvm::CallInst *instruction, const llvm::BasicBlock *bb);
 bool analyze_dxil_instruction_secondary_pass(Converter::Impl &impl, const llvm::CallInst *instruction);
+void analyze_xbox_typed_load(Converter::Impl &impl, const llvm::CallInst *instruction);
 
 struct AllocaCBVForwardingTracking;
 bool analyze_alloca_cbv_forwarding_pre_resource_emit(Converter::Impl &impl,

@@ -1326,6 +1326,46 @@ bool emit_buffer_load_instruction(Converter::Impl &impl, const llvm::CallInst *i
 	return true;
 }
 
+// Loads the 32-bit word that holds the byte at byte offset operand 2 of the raw buffer in operand 1, through the
+// same access path as a raw bufferLoad (byte offset divided down to a word, offset buffer and range check applied).
+// For calls that address a raw storage buffer by byte with the operand layout of bufferLoad. Returns 0 when the
+// buffer is not a raw storage buffer.
+spv::Id emit_raw_storage_buffer_load_word_at_byte(Converter::Impl &impl, const llvm::CallInst *instruction)
+{
+	auto &builder = impl.builder();
+	spv::Id image_id = impl.get_id_for_value(instruction->getOperand(1));
+	auto itr = impl.handle_to_resource_meta.find(image_id);
+	if (itr == impl.handle_to_resource_meta.end() || itr->second.kind != DXIL::ResourceKind::RawBuffer ||
+	    itr->second.storage != spv::StorageClassStorageBuffer)
+		return 0;
+
+	const auto &meta = itr->second;
+	auto access = build_buffer_access(impl, instruction, 0, meta.index_offset_id,
+	                                  instruction->getOperand(2)->getType(), 1, false);
+	if (access.raw_vec_size != 1)
+		return 0;
+
+	spv::Id buffer_id = get_buffer_alias_handle(impl, meta, image_id, RawType::Integer, RawWidth::B32, 1);
+	if (!buffer_id)
+		return 0;
+
+	spv::Id uint_type = builder.makeUintType(32);
+	auto *chain_op = impl.allocate(spv::OpAccessChain, builder.makePointer(spv::StorageClassStorageBuffer, uint_type));
+	chain_op->add_id(buffer_id);
+	chain_op->add_id(builder.makeUintConstant(0));
+	chain_op->add_id(access.index_id);
+	impl.add(chain_op);
+
+	if (meta.non_uniform)
+		builder.addDecoration(chain_op->id, spv::DecorationNonUniform);
+
+	auto *load_op = impl.allocate(spv::OpLoad, uint_type);
+	load_op->add_id(chain_op->id);
+	add_vkmm_access_qualifiers(impl, load_op, meta.vkmm);
+	impl.add(load_op, meta.rov);
+	return load_op->id;
+}
+
 static bool emit_physical_buffer_store_instruction(Converter::Impl &impl, const llvm::CallInst *instruction,
                                                    const Converter::Impl::ResourceMeta &meta,
                                                    uint32_t alignment = 0, bool is_vector = false)
