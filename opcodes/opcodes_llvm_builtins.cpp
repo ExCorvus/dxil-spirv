@@ -31,6 +31,7 @@
 #include "dxil/dxil_arithmetic.hpp"
 #include "dxil/dxil_ags.hpp"
 #include "dxil/dxil_ray_tracing.hpp"
+#include "dxil/dxil_waveops.hpp"
 #include <limits>
 
 namespace dxil_spv
@@ -3309,6 +3310,35 @@ static bool emit_xbox_bfi(Converter::Impl &impl, const llvm::CallInst &inst)
 	return true;
 }
 
+// llvm.copysign.f32(magnitude, sign): the magnitude of the first value with the sign bit of the second.
+bool emit_llvm_copysign_instruction(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	if (inst.getType()->getTypeID() != llvm::Type::TypeID::FloatTyID)
+	{
+		LOGE("llvm.copysign is only supported for 32-bit floats.\n");
+		return false;
+	}
+
+	auto &builder = impl.builder();
+	spv::Id uint_type = builder.makeUintType(32);
+
+	auto *mag = impl.allocate(spv::OpBitcast, uint_type);
+	mag->add_id(impl.get_id_for_value(inst.getOperand(0)));
+	impl.add(mag);
+	auto *sign = impl.allocate(spv::OpBitcast, uint_type);
+	sign->add_id(impl.get_id_for_value(inst.getOperand(1)));
+	impl.add(sign);
+
+	spv::Id lhs = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, mag->id, builder.makeUintConstant(0x7fffffffu));
+	spv::Id rhs = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, sign->id, builder.makeUintConstant(0x80000000u));
+	spv::Id bits = emit_xbox_binary(impl, spv::OpBitwiseOr, uint_type, lhs, rhs);
+
+	auto *result = impl.allocate(spv::OpBitcast, &inst);
+	result->add_id(bits);
+	impl.add(result);
+	return true;
+}
+
 // xbox.V_ALIGNBYTE_B32(i32 op, hi, lo, shift): the low 32 bits of the 64-bit value hi:lo shifted right by
 // 8 * (shift & 3) bits.
 static bool emit_xbox_alignbyte(Converter::Impl &impl, const llvm::CallInst &inst)
@@ -3387,6 +3417,222 @@ static bool emit_xbox_bcnt64(Converter::Impl &impl, const llvm::CallInst &inst)
 	return true;
 }
 
+// The lane functions below work from the lane number and lane count the driver chose for the subgroup; none of
+// them assumes 32 or 64 lanes.
+static spv::Id emit_xbox_lane_id(Converter::Impl &impl)
+{
+	auto &builder = impl.builder();
+	builder.addCapability(spv::CapabilityGroupNonUniform);
+	auto *op = impl.allocate(spv::OpLoad, builder.makeUintType(32));
+	op->add_id(impl.spirv_module.get_builtin_shader_input(spv::BuiltInSubgroupLocalInvocationId));
+	impl.add(op);
+	return op->id;
+}
+
+static spv::Id emit_xbox_extract(Converter::Impl &impl, spv::Id type, spv::Id composite, unsigned index)
+{
+	auto *op = impl.allocate(spv::OpCompositeExtract, type);
+	op->add_id(composite);
+	op->add_literal(index);
+	impl.add(op);
+	return op->id;
+}
+
+static spv::Id emit_xbox_select(Converter::Impl &impl, spv::Id type, spv::Id cond, spv::Id a, spv::Id b)
+{
+	auto *op = impl.allocate(spv::OpSelect, type);
+	op->add_id(cond);
+	op->add_id(a);
+	op->add_id(b);
+	impl.add(op);
+	return op->id;
+}
+
+// xbox.LaneSwizzle(i32 op, value, i32 pattern): the value of another lane. The pattern is AMD's ds_swizzle
+// offset in bit-mask mode (bit 15 clear): within each group of 32 lanes, the lane read is
+// ((lane & and_mask) | or_mask) ^ xor_mask, with the masks in bits 0-4, 5-9 and 10-14.
+static bool emit_xbox_lane_swizzle(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	auto &builder = impl.builder();
+	auto *pattern_value = llvm::dyn_cast<llvm::ConstantInt>(inst.getOperand(2));
+	if (!pattern_value || (pattern_value->getUniqueInteger().getZExtValue() & 0x8000) != 0)
+	{
+		LOGE("xbox.LaneSwizzle: only a constant pattern in bit-mask mode is supported.\n");
+		return false;
+	}
+
+	uint32_t pattern = uint32_t(pattern_value->getUniqueInteger().getZExtValue());
+	spv::Id uint_type = builder.makeUintType(32);
+	spv::Id lane = emit_xbox_lane_id(impl);
+	spv::Id in_group = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, lane,
+	                                    builder.makeUintConstant(31u & (pattern & 31u)));
+	spv::Id with_or = emit_xbox_binary(impl, spv::OpBitwiseOr, uint_type, in_group,
+	                                   builder.makeUintConstant((pattern >> 5) & 31u));
+	spv::Id with_xor = emit_xbox_binary(impl, spv::OpBitwiseXor, uint_type, with_or,
+	                                    builder.makeUintConstant((pattern >> 10) & 31u));
+	spv::Id group = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, lane, builder.makeUintConstant(~31u));
+	spv::Id target = emit_xbox_binary(impl, spv::OpBitwiseOr, uint_type, group, with_xor);
+
+	auto *op = impl.allocate(spv::OpGroupNonUniformShuffle, &inst);
+	op->add_id(builder.makeUintConstant(spv::ScopeSubgroup));
+	op->add_id(impl.get_id_for_value(inst.getOperand(1)));
+	op->add_id(target);
+	impl.add(op);
+	builder.addCapability(spv::CapabilityGroupNonUniformShuffle);
+	return true;
+}
+
+// The bit of this lane in a 64-bit lane mask {lo, hi}, as a bool.
+static spv::Id emit_xbox_lane_bit(Converter::Impl &impl, spv::Id mask)
+{
+	auto &builder = impl.builder();
+	spv::Id uint_type = builder.makeUintType(32);
+	spv::Id bool_type = builder.makeBoolType();
+	spv::Id lane = emit_xbox_lane_id(impl);
+	spv::Id lo = emit_xbox_extract(impl, uint_type, mask, 0);
+	spv::Id hi = emit_xbox_extract(impl, uint_type, mask, 1);
+	spv::Id low_half = emit_xbox_binary(impl, spv::OpULessThan, bool_type, lane, builder.makeUintConstant(32));
+	spv::Id word = emit_xbox_select(impl, uint_type, low_half, lo, hi);
+	spv::Id shift = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, lane, builder.makeUintConstant(31));
+	spv::Id bits = emit_xbox_binary(impl, spv::OpShiftRightLogical, uint_type, word, shift);
+	spv::Id bit = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, bits, builder.makeUintConstant(1));
+	return emit_xbox_binary(impl, spv::OpINotEqual, bool_type, bit, builder.makeUintConstant(0));
+}
+
+// xbox.V_CNDMASK_B32(i32 op, {i32, i32} lane mask, {i32 a, i32 b}): b where this lane's bit is set, else a.
+static bool emit_xbox_cndmask(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	spv::Id type = impl.get_type_id(inst.getType());
+	spv::Id set = emit_xbox_lane_bit(impl, impl.get_id_for_value(inst.getOperand(1)));
+	spv::Id values = impl.get_id_for_value(inst.getOperand(2));
+	spv::Id a = emit_xbox_extract(impl, type, values, 0);
+	spv::Id b = emit_xbox_extract(impl, type, values, 1);
+	impl.rewrite_value(&inst, emit_xbox_select(impl, type, set, b, a));
+	return true;
+}
+
+// xbox.Ballot64(i32 op, i32 condition): the 64-bit mask {lo, hi} of the lanes where the condition is not zero.
+static bool emit_xbox_ballot64(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	auto &builder = impl.builder();
+	spv::Id uint_type = builder.makeUintType(32);
+	spv::Id cond = emit_xbox_binary(impl, spv::OpINotEqual, builder.makeBoolType(),
+	                                impl.get_id_for_value(inst.getOperand(1)), builder.makeUintConstant(0));
+
+	auto *ballot = impl.allocate(spv::OpGroupNonUniformBallot, builder.makeVectorType(uint_type, 4));
+	ballot->add_id(builder.makeUintConstant(spv::ScopeSubgroup));
+	ballot->add_id(cond);
+	impl.add(ballot);
+	builder.addCapability(spv::CapabilityGroupNonUniformBallot);
+
+	auto *construct = impl.allocate(spv::OpCompositeConstruct, &inst);
+	construct->add_id(emit_xbox_extract(impl, uint_type, ballot->id, 0));
+	construct->add_id(emit_xbox_extract(impl, uint_type, ballot->id, 1));
+	impl.add(construct);
+	return true;
+}
+
+// xbox.MBCNT64(i32 op, {i32 lo, i32 hi} mask): the number of mask bits below this lane.
+static bool emit_xbox_mbcnt64(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	auto &builder = impl.builder();
+	spv::Id uint_type = builder.makeUintType(32);
+	spv::Id bool_type = builder.makeBoolType();
+	spv::Id mask = impl.get_id_for_value(inst.getOperand(1));
+	spv::Id lane = emit_xbox_lane_id(impl);
+	spv::Id lo = emit_xbox_extract(impl, uint_type, mask, 0);
+	spv::Id hi = emit_xbox_extract(impl, uint_type, mask, 1);
+	spv::Id low_half = emit_xbox_binary(impl, spv::OpULessThan, bool_type, lane, builder.makeUintConstant(32));
+	spv::Id shift = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, lane, builder.makeUintConstant(31));
+	spv::Id one_at = emit_xbox_binary(impl, spv::OpShiftLeftLogical, uint_type, builder.makeUintConstant(1), shift);
+	spv::Id below = emit_xbox_binary(impl, spv::OpISub, uint_type, one_at, builder.makeUintConstant(1));
+	spv::Id lo_part = emit_xbox_select(impl, uint_type, low_half,
+	                                   emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, lo, below), lo);
+	spv::Id hi_part = emit_xbox_select(impl, uint_type, low_half, builder.makeUintConstant(0),
+	                                   emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, hi, below));
+
+	auto *count_lo = impl.allocate(spv::OpBitCount, uint_type);
+	count_lo->add_id(lo_part);
+	impl.add(count_lo);
+	auto *count_hi = impl.allocate(spv::OpBitCount, uint_type);
+	count_hi->add_id(hi_part);
+	impl.add(count_hi);
+	impl.rewrite_value(&inst, emit_xbox_binary(impl, spv::OpIAdd, uint_type, count_lo->id, count_hi->id));
+	return true;
+}
+
+// xbox.WaveMin_U32(i32 op, i32 value): the smallest value over the active lanes.
+static bool emit_xbox_wave_min_u32(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	auto &builder = impl.builder();
+	auto *op = impl.allocate(spv::OpGroupNonUniformUMin, &inst);
+	op->add_id(builder.makeUintConstant(spv::ScopeSubgroup));
+	op->add_literal(spv::GroupOperationReduce);
+	op->add_id(impl.get_id_for_value(inst.getOperand(1)));
+	impl.add(op);
+	builder.addCapability(spv::CapabilityGroupNonUniformArithmetic);
+	return true;
+}
+
+// xbox.TypedLoad.i32(i32 op, handle, i32 index, i32 format) -> {i32 x4, i32 status}, the shape of dx.op.bufferLoad.
+// Only seen on a raw buffer passed by GPU address, with format 65 (DXGI_FORMAT_A8_UNORM, one byte). Read here as
+// the byte at byte offset index, handed back as an integer in the first value (inferred from how the shader uses
+// it: unaligned offsets, only the low bits kept). Other formats and buffer kinds are refused. The other values
+// and the status are 0.
+static bool emit_xbox_typed_load(Converter::Impl &impl, const llvm::CallInst &inst)
+{
+	auto &builder = impl.builder();
+	auto *format_value = llvm::dyn_cast<llvm::ConstantInt>(inst.getOperand(3));
+	spv::Id ptr_id = impl.get_id_for_value(inst.getOperand(1));
+	auto meta_itr = impl.handle_to_resource_meta.find(ptr_id);
+
+	if (!format_value || format_value->getUniqueInteger().getZExtValue() != 65 ||
+	    meta_itr == impl.handle_to_resource_meta.end() ||
+	    meta_itr->second.storage != spv::StorageClassPhysicalStorageBuffer || meta_itr->second.stride != 0)
+	{
+		LOGE("xbox.TypedLoad: only format 65 on a raw buffer passed by GPU address is supported.\n");
+		return false;
+	}
+
+	spv::Id uint_type = builder.makeUintType(32);
+	spv::Id byte_offset = impl.get_id_for_value(inst.getOperand(2));
+	spv::Id word_offset = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, byte_offset, builder.makeUintConstant(~3u));
+	spv::Id address = emit_u32x2_u32_add(impl, ptr_id, word_offset);
+
+	auto ptr_meta = meta_itr->second.physical_pointer_meta;
+	ptr_meta.stride = 0;
+	spv::Id block_ptr_type = impl.get_physical_pointer_block_type(uint_type, ptr_meta);
+
+	auto *cast_op = impl.allocate(spv::OpBitcast, block_ptr_type);
+	cast_op->add_id(address);
+	impl.add(cast_op);
+
+	auto *chain_op = impl.allocate(spv::OpInBoundsAccessChain,
+	                               builder.makePointer(spv::StorageClassPhysicalStorageBuffer, uint_type));
+	chain_op->add_id(cast_op->id);
+	chain_op->add_id(builder.makeUintConstant(0));
+	impl.add(chain_op);
+
+	auto *load = impl.allocate(spv::OpLoad, uint_type);
+	load->add_id(chain_op->id);
+	load->add_literal(spv::MemoryAccessAlignedMask);
+	load->add_literal(4);
+	add_vkmm_access_qualifiers(impl, load, meta_itr->second.vkmm);
+	impl.add(load);
+
+	spv::Id byte_in_word = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, byte_offset, builder.makeUintConstant(3));
+	spv::Id shift = emit_xbox_binary(impl, spv::OpIMul, uint_type, byte_in_word, builder.makeUintConstant(8));
+	spv::Id shifted = emit_xbox_binary(impl, spv::OpShiftRightLogical, uint_type, load->id, shift);
+	spv::Id value = emit_xbox_binary(impl, spv::OpBitwiseAnd, uint_type, shifted, builder.makeUintConstant(0xff));
+
+	auto *construct = impl.allocate(spv::OpCompositeConstruct, &inst);
+	construct->add_id(value);
+	for (unsigned i = 1; i < 5; i++)
+		construct->add_id(builder.makeUintConstant(0));
+	impl.add(construct);
+	return true;
+}
+
 // Calls to the functions of the Xbox shader compiler (xbox.*), by name.
 bool emit_xbox_call_instruction(Converter::Impl &impl, const llvm::CallInst &inst)
 {
@@ -3437,6 +3683,30 @@ bool emit_xbox_call_instruction(Converter::Impl &impl, const llvm::CallInst &ins
 		return emit_xbox_packed_half(impl, inst, true);
 	else if (strcmp(name, "xbox.S_BCNT1_U64") == 0)
 		return emit_xbox_bcnt64(impl, inst);
+	else if (strcmp(name, "xbox.GetLaneID") == 0)
+	{
+		impl.rewrite_value(&inst, emit_xbox_lane_id(impl));
+		return true;
+	}
+	else if (strcmp(name, "xbox.ReadLane.i32") == 0)
+	{
+		impl.builder().addCapability(spv::CapabilityGroupNonUniformShuffle);
+		return emit_wave_read_lane_at_instruction(impl, &inst);
+	}
+	else if (strcmp(name, "xbox.MakeUniform.i32") == 0 || strcmp(name, "xbox.MakeUniform.i64") == 0)
+		return emit_wave_read_lane_first_instruction(impl, &inst);
+	else if (strcmp(name, "xbox.LaneSwizzle.i32") == 0)
+		return emit_xbox_lane_swizzle(impl, inst);
+	else if (strcmp(name, "xbox.V_CNDMASK_B32") == 0)
+		return emit_xbox_cndmask(impl, inst);
+	else if (strcmp(name, "xbox.Ballot64") == 0)
+		return emit_xbox_ballot64(impl, inst);
+	else if (strcmp(name, "xbox.MBCNT64") == 0)
+		return emit_xbox_mbcnt64(impl, inst);
+	else if (strcmp(name, "xbox.WaveMin_U32") == 0)
+		return emit_xbox_wave_min_u32(impl, inst);
+	else if (strcmp(name, "xbox.TypedLoad.i32") == 0)
+		return emit_xbox_typed_load(impl, inst);
 
 	LOGE("Xbox shader compiler function '%s' is not supported.\n", name);
 	return false;
